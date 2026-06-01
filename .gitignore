@@ -1,0 +1,30 @@
+out
+dist
+node_modules
+.vscode-test/
+*.vsix
+CLAUDE.md
+
+# Compiler output
+out/
+dist/
+
+# Dependencies
+node_modules/
+
+# VS Code extension artifacts
+.vscode-test/
+*.vsix
+
+# Local secrets & Security
+.env
+.env.*
+*.pem
+*.key
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# AI Context files (Keep stealth logic out of the public repo)
+CLAUDE.md
