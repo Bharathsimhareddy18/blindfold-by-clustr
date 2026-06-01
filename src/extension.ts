@@ -13,13 +13,12 @@ import {
 	BlindfoldDebugConfigurationProvider,
 	type SecretsMap,
 } from './injector';
-
-// ---------------------------------------------------------------------------
-// Workspace-state keys (persisted across window reloads for crash recovery)
-// ---------------------------------------------------------------------------
-
-const STATE_KEY_ACTIVE: string = 'blindfold.active';
-const STATE_KEY_VAULT_PATH: string = 'blindfold.vaultPath';
+import {
+    ensureGitignore,
+    lockVaultState,
+    clearVaultState,
+    recoverVaultState,
+} from './recovery';
 
 // ---------------------------------------------------------------------------
 // Status-bar labels
@@ -140,8 +139,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		);
 
 		// Persist state for crash recovery.
-		await context.workspaceState.update(STATE_KEY_ACTIVE, true);
-		await context.workspaceState.update(STATE_KEY_VAULT_PATH, result.vaultPath);
+		await lockVaultState(context, result.vaultPath);
 
 		isActive = true;
 		vaultPath = result.vaultPath;
@@ -177,8 +175,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		}
 
 		// Purge persisted state.
-		await context.workspaceState.update(STATE_KEY_ACTIVE, undefined);
-		await context.workspaceState.update(STATE_KEY_VAULT_PATH, undefined);
+		await clearVaultState(context);
 
 		isActive = false;
 		vaultPath = undefined;
@@ -195,34 +192,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// forced quit, etc.) the workspace state still records the vault path.
 	// Re-inject secrets so the user doesn't have to toggle manually.
 
-	const wasActive: boolean | undefined = context.workspaceState.get<boolean>(
-		STATE_KEY_ACTIVE,
-	);
-	const recoveredVaultPath: string | undefined =
-		context.workspaceState.get<string>(STATE_KEY_VAULT_PATH);
+	const recoveredVaultPath: string | null = await recoverVaultState(context);
+	if (recoveredVaultPath !== null) {
+		const secrets: SecretsMap = await injectIntoTerminals(
+			recoveredVaultPath,
+			context.environmentVariableCollection,
+		);
+		const provider: BlindfoldDebugConfigurationProvider =
+			new BlindfoldDebugConfigurationProvider(secrets);
+		debugProviderDisposable =
+			vscode.debug.registerDebugConfigurationProvider('*', provider);
 
-	if (wasActive === true && typeof recoveredVaultPath === 'string') {
-		try {
-			await fs.access(recoveredVaultPath);
-			// Vault file still exists — re-inject.
-			const secrets: SecretsMap = await injectIntoTerminals(
-				recoveredVaultPath,
-				context.environmentVariableCollection,
-			);
-			const provider: BlindfoldDebugConfigurationProvider =
-				new BlindfoldDebugConfigurationProvider(secrets);
-			debugProviderDisposable =
-				vscode.debug.registerDebugConfigurationProvider('*', provider);
-
-			isActive = true;
-			vaultPath = recoveredVaultPath;
-			statusBarItem.text = STATUS_ACTIVE;
-		} catch {
-			// Vault file is gone (e.g. manually deleted). Purge the stale
-			// workspace state and start fresh.
-			await context.workspaceState.update(STATE_KEY_ACTIVE, undefined);
-			await context.workspaceState.update(STATE_KEY_VAULT_PATH, undefined);
-		}
+		isActive = true;
+		vaultPath = recoveredVaultPath;
+		statusBarItem.text = STATUS_ACTIVE;
 	}
 
 	// -------- Command registration -----------------------------------------
@@ -254,33 +237,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// This runs once per activation and fails silently — it is a best-effort
 	// guard, not a critical path.
 
-	void (async (): Promise<void> => {
-		try {
-			const workspaceRoot: string | undefined = getWorkspaceRoot();
-			if (!workspaceRoot) {
-				return;
-			}
-			const gitignorePath: string = path.join(workspaceRoot, '.gitignore');
-			let content: string;
-			try {
-				content = await fs.readFile(gitignorePath, 'utf-8');
-			} catch {
-				// .gitignore doesn't exist — create one.
-				await fs.writeFile(gitignorePath, '.env\n', 'utf-8');
-				return;
-			}
-			// Check if .env is already listed as a line.
-			const lines: string[] = content.split('\n');
-			const hasEnvEntry: boolean = lines.some(
-				(line: string): boolean => line.trim() === '.env',
-			);
-			if (!hasEnvEntry) {
-				await fs.appendFile(gitignorePath, '\n.env\n', 'utf-8');
-			}
-		} catch {
-			// Non-critical — silently ignore.
+	{
+		const workspaceRoot: string | undefined = getWorkspaceRoot();
+		if (workspaceRoot) {
+			void ensureGitignore(workspaceRoot);
 		}
-	})();
+	}
 }
 
 /**

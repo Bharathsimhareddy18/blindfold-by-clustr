@@ -10,13 +10,6 @@ import * as os from 'node:os';
 const VAULT_ROOT: string = path.join(os.homedir(), '.secrets', 'blindfold');
 
 /**
- * Content written to the workspace as a decoy after the real .env is vaulted.
- * Autonomous tooling that reads this file will see inert placeholder values,
- * poisoning any context the tool assembles from disk.
- */
-const DECOY_CONTENT: string = 'BLINDFOLD_ACTIVE=true\n# Decoy Configuration\n';
-
-/**
  * Maximum bytes to read from a .env file when checking whether it is already
  * a decoy. The decoy marker appears in the first line so a small read is
  * sufficient and avoids loading large files into memory.
@@ -80,6 +73,36 @@ async function isDecoyFile(envPath: string): Promise<boolean> {
 }
 
 /**
+ * Transform plaintext .env content into a structurally identical decoy.
+ *
+ * Every `KEY=VALUE` assignment has its value replaced with the sentinel
+ * string `[BLINDFOLD_ACTIVE_MOGGED]`.  Lines that do not match the
+ * assignment pattern (comments, blank lines, `export`-prefixed lines)
+ * pass through unchanged so the overall file layout is preserved.
+ *
+ * The sentinel `BLINDFOLD_ACTIVE=true` is prepended as the first line
+ * so that {@link isDecoyFile} (which reads the first 128 bytes) can
+ * still recognise the decoy.
+ */
+function maskEnvContent(originalContent: string): string {
+    const lines: string[] = originalContent.split('\n');
+    const KEY_VALUE_RE: RegExp = /^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.*)$/;
+
+    const maskedLines: string[] = ['BLINDFOLD_ACTIVE=true'];
+
+    for (const line of lines) {
+        const match: RegExpMatchArray | null = line.match(KEY_VALUE_RE);
+        if (match) {
+            maskedLines.push(`${match[1]}=[BLINDFOLD_ACTIVE_MOGGED]`);
+        } else {
+            maskedLines.push(line);
+        }
+    }
+
+    return maskedLines.join('\n');
+}
+
+/**
  * Move the workspace `.env` into the OS-level vault and replace it with a
  * context-poisoned decoy.
  *
@@ -102,14 +125,19 @@ export async function vaultEnvFile(workspaceRoot: string): Promise<VaultResult> 
         return { vaultPath, workspaceRoot };
     }
 
+    // Read the real .env content BEFORE moving the file so we can
+    // generate a structurally identical decoy from its layout.
+    const originalContent: string = await fs.readFile(envPath, 'utf-8');
+
     // Ensure the vault root directory exists (no-op if already present).
     await fs.mkdir(VAULT_ROOT, { recursive: true });
 
     // Move the real .env into the vault. Handle cross-device EXDEV errors.
     try {
         await fs.rename(envPath, vaultPath);
-    } catch (error: any) {
-        if (error.code === 'EXDEV') {
+    } catch (error: unknown) {
+        const nodeError: NodeJS.ErrnoException = error as NodeJS.ErrnoException;
+        if (nodeError.code === 'EXDEV') {
             await fs.copyFile(envPath, vaultPath);
             await fs.unlink(envPath);
         } else {
@@ -117,9 +145,11 @@ export async function vaultEnvFile(workspaceRoot: string): Promise<VaultResult> 
         }
     }
 
-    // Write the context-poisoned decoy back into the workspace so autonomous
-    // tooling that reads the expected filename sees only inert values.
-    await fs.writeFile(envPath, DECOY_CONTENT, 'utf-8');
+    // Generate a schema-preserving masked decoy from the original content
+    // and write it back into the workspace.  Autonomous tooling that reads
+    // the expected filename sees only inert `[BLINDFOLD_ACTIVE_MOGGED]` values.
+    const maskedContent: string = maskEnvContent(originalContent);
+    await fs.writeFile(envPath, maskedContent, 'utf-8');
 
     return { vaultPath, workspaceRoot };
 }
@@ -137,8 +167,9 @@ export async function restoreEnvFile(workspaceRoot: string, vaultPath: string): 
     
     try {
         await fs.rename(vaultPath, envPath);
-    } catch (error: any) {
-        if (error.code === 'EXDEV') {
+    } catch (error: unknown) {
+        const nodeError: NodeJS.ErrnoException = error as NodeJS.ErrnoException;
+        if (nodeError.code === 'EXDEV') {
             await fs.copyFile(vaultPath, envPath);
             await fs.unlink(vaultPath);
         } else {
