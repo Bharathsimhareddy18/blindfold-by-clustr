@@ -141,6 +141,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		// Persist state for crash recovery.
 		await lockVaultState(context, result.vaultPath);
 
+		// Ensure .env is gitignored so the masked decoy is never committed.
+		void ensureGitignore(workspaceRoot);
+
 		isActive = true;
 		vaultPath = result.vaultPath;
 		statusBarItem.text = STATUS_ACTIVE;
