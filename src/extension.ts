@@ -123,7 +123,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			}
 		}
 
-		const result: VaultResult = await vaultEnvFile(workspaceRoot);
+		// Resolve canary email: use persisted value if available, otherwise
+		// prompt once and persist the answer.  An empty/blank response skips
+		// the canary — the shield still activates without it.
+		const STATE_KEY_CANARY_EMAIL: string = 'blindfold.canaryEmail';
+		let canaryEmail: string | undefined =
+			context.globalState.get<string>(STATE_KEY_CANARY_EMAIL);
+		if (canaryEmail === undefined) {
+			const input: string | undefined =
+				await vscode.window.showInputBox({
+					prompt:
+						'Enter email to receive alerts if your keys are scraped (Leave blank to skip)',
+					placeHolder: 'security@example.com',
+				});
+			if (input !== undefined && input.trim() !== '') {
+				canaryEmail = input.trim();
+				await context.globalState.update(
+					STATE_KEY_CANARY_EMAIL,
+					canaryEmail,
+				);
+			}
+		}
+
+		const result: VaultResult = await vaultEnvFile(
+			workspaceRoot,
+			canaryEmail,
+		);
 		const secrets: SecretsMap = await injectIntoTerminals(
 			result.vaultPath,
 			context.environmentVariableCollection,
@@ -232,6 +257,204 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		},
 	);
 	context.subscriptions.push(toggleCommand);
+
+	// -------- Live key interception ----------------------------------------
+	//
+	// When the shield is active and the user edits the decoy .env, intercept
+	// saves to vault new keys and mask them before they hit disk.  This lets
+	// the user freely append keys to an active decoy file, hit save, and
+	// watch them instantly mask and vault.
+
+	const saveListener: vscode.Disposable =
+		vscode.workspace.onWillSaveTextDocument(
+			async (
+				event: vscode.TextDocumentWillSaveEvent,
+			): Promise<void> => {
+				// Only intercept when the shield is active.
+				const active: boolean | undefined =
+					context.workspaceState.get<boolean>(
+						'blindfold.active',
+					);
+				if (active !== true) {
+					return;
+				}
+
+				const workspaceRoot: string | undefined =
+					getWorkspaceRoot();
+				if (!workspaceRoot) {
+					return;
+				}
+
+				const envPath: string = path.join(
+					workspaceRoot,
+					'.env',
+				);
+				if (event.document.fileName !== envPath) {
+					return;
+				}
+
+				const storedVaultPath: string | undefined =
+					context.workspaceState.get<string>(
+						'blindfold.vaultPath',
+					);
+				if (typeof storedVaultPath !== 'string') {
+					return;
+				}
+
+				// Scan the dirty document for new unmasked key-value
+				// pairs, vault them, and mask them before the save
+				// commits to disk.
+				event.waitUntil(
+					(async (): Promise<vscode.TextEdit[]> => {
+						const document: vscode.TextDocument =
+							event.document;
+						const KEY_VALUE_RE: RegExp =
+							/^([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(.*)$/;
+
+						interface NewKey {
+							readonly key: string;
+							readonly value: string;
+							readonly lineIndex: number;
+						}
+
+						const newKeys: NewKey[] = [];
+						let inHoneypot: boolean = false;
+
+						for (
+							let i: number = 0;
+							i < document.lineCount;
+							i++
+						) {
+							const line: vscode.TextLine =
+								document.lineAt(i);
+							const text: string = line.text;
+
+							// Once we enter the honeypot section,
+							// skip everything below — canary
+							// tokens must never be re-masked.
+							if (
+								text.includes(
+									'# --- SECURITY HONEYPOT ---',
+								)
+							) {
+								inHoneypot = true;
+								continue;
+							}
+							if (inHoneypot) {
+								continue;
+							}
+
+							// Skip the guard marker, comments,
+							// and blank lines.
+							if (
+								text.includes(
+									'BLINDFOLD_ACTIVE=true',
+								)
+							) {
+								continue;
+							}
+							if (
+								text.startsWith('#') ||
+								text.trim() === ''
+							) {
+								continue;
+							}
+
+							// Skip lines that are already masked.
+							if (
+								text.includes(
+									'[BLINDFOLD_ACTIVE_MOGGED]',
+								)
+							) {
+								continue;
+							}
+
+							const match: RegExpMatchArray | null =
+								text.match(KEY_VALUE_RE);
+							if (!match) {
+								continue;
+							}
+
+							const key: string = match[1];
+							const value: string = match[2];
+
+							// Skip empty values.
+							if (value.trim() === '') {
+								continue;
+							}
+
+							newKeys.push({
+								key,
+								value,
+								lineIndex: i,
+							});
+						}
+
+						if (newKeys.length === 0) {
+							return [];
+						}
+
+						// Append the raw key-value pairs to the
+						// vault file.
+						const newEntries: string =
+							newKeys
+								.map(
+									(
+										nk: NewKey,
+									): string =>
+										`${nk.key}=${nk.value}`,
+								)
+								.join('\n') + '\n';
+						await fs.appendFile(
+							storedVaultPath,
+							newEntries,
+							'utf-8',
+						);
+
+						// Re-inject all vaulted secrets into the
+						// terminal environment so new keys are
+						// available immediately.
+						await injectIntoTerminals(
+							storedVaultPath,
+							context
+								.environmentVariableCollection,
+						);
+
+						// Build TextEdits to mask the new keys
+						// in the document before the save
+						// commits to disk.
+						const edits: vscode.TextEdit[] =
+							newKeys.map(
+								(
+									nk: NewKey,
+								): vscode.TextEdit => {
+									const docLine: vscode.TextLine =
+										document.lineAt(
+											nk.lineIndex,
+										);
+									const eqIndex: number =
+										docLine.text.indexOf(
+											'=',
+										);
+									return vscode.TextEdit.replace(
+										new vscode.Range(
+											nk.lineIndex,
+											eqIndex + 1,
+											nk.lineIndex,
+											docLine.text
+												.length,
+										),
+										'[BLINDFOLD_ACTIVE_MOGGED]',
+									);
+								},
+							);
+
+						return edits;
+					})(),
+				);
+			},
+		);
+	context.subscriptions.push(saveListener);
 
 	// -------- .gitignore protection ----------------------------------------
 	//
